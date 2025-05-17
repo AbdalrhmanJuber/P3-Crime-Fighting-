@@ -138,8 +138,13 @@ void plan_new_mission(Gang* gang, SimulationConfig config) {
         gang->members[i].preparation_level = 0;
     }
     
-    // Select a random target
+    // Select a random target - make sure it's truly random by using NUM_CRIME_TYPES-1
+    // NUM_CRIME_TYPES is the last entry in the enum, not a valid crime type
     gang->current_target = (CrimeType)random_int(0, NUM_CRIME_TYPES - 1);
+    
+    // Debug log to verify crime type assignment
+    printf("Gang %d selected target crime: %s (enum value: %d)\n", 
+           gang->id, crime_type_to_string(gang->current_target), gang->current_target);
     
     // Set preparation time
     gang->preparation_time = random_int(config.preparation_time_min, config.preparation_time_max);

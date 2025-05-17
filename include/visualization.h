@@ -49,12 +49,12 @@ void initialize_visualization(int* argc, char** argv, VisualizationContext* ctx)
 void display_function();
 void reshape_function(int width, int height);
 void timer_function(int value);
+void idle_function();
 void draw_gangs(VisualizationContext* ctx);
 void draw_police(VisualizationContext* ctx);
 void draw_stats(VisualizationContext* ctx);
 void draw_status_bar(VisualizationContext* ctx);
 void draw_debug_info(VisualizationContext* ctx);
 void cleanup_visualization();
-const char* crime_type_to_string(CrimeType type);
 
 #endif /* VISUALIZATION_H */

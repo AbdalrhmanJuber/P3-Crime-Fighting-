@@ -379,22 +379,10 @@ void* visualization_thread_func(void* arg) {
         return NULL;
     }
     
-    // Inform that we're attempting to start GLUT main loop
-    printf("Starting GLUT main loop for OpenGL visualization...\n");
+    // In graphical mode, this thread should only update data periodically,
+    // NOT try to run the GLUT main loop (which should run in the main thread)
+    printf("Visualization thread started in graphical mode, will update data only\n");
     
-    // Try to start the main loop and let GLUT handle the rendering
-    // C doesn't have try-catch, but we can set a flag in case glutMainLoop returns due to error
-    // Note: glutMainLoop almost never returns, but if it does, we can handle it
-    glutMainLoop();
-    
-    // This code is only reached if glutMainLoop() somehow returns - fall back to text mode
-    fprintf(stderr, "OpenGL visualization stopped unexpectedly. Falling back to text-only mode.\n");
-    
-    pthread_mutex_lock(&viz_context.mutex);
-    viz_context.simulation_running = true;
-    pthread_mutex_unlock(&viz_context.mutex);
-    
-    // Text-only fallback
     int frame = 0;
     while (1) {
         // Thread-safe access to simulation status
@@ -402,21 +390,104 @@ void* visualization_thread_func(void* arg) {
         pthread_mutex_lock(&viz_context.mutex);
         keep_running = viz_context.simulation_running;
         viz_context.viz_thread_health++; // Increment health counter
+        
+        // Update animation time
+        viz_context.animation_time += 0.1f;
         pthread_mutex_unlock(&viz_context.mutex);
         
         if (!keep_running) break;
         
-        if (frame++ % 5 == 0) {
-            printf("Text-mode fallback: frame %d, %d gangs active\n", 
-                frame, viz_context.num_gangs);
-        }
-        usleep(viz_context.refresh_rate * 1000);
+        // Request a redraw
+        glutPostRedisplay();
+        
+        usleep(viz_context.refresh_rate * 1000); // Convert ms to μs
     }
     
     // Mark thread as stopped before exiting
     pthread_mutex_lock(&viz_context.mutex);
     viz_context.viz_thread_running = false;
     pthread_mutex_unlock(&viz_context.mutex);
+    return NULL;
+}
+
+// Thread function for state updates
+void* gang_state_update_thread(void* arg) {
+    int num_gangs = shared_state->num_gangs;
+    bool simulation_ended = false;
+    
+    // Process update loop that runs alongside glutMainLoop
+    while (1) {  // Keep running even if simulation ends
+        // Check if we've reached termination conditions
+        bool sim_running = shared_state->simulation_running;
+        
+        // If simulation just ended, print a message
+        if (sim_running == false && simulation_ended == false) {
+            simulation_ended = true;
+            printf("Simulation has ended, but visualization will continue\n");
+        }
+        
+        // Update gang visualization states from shared memory
+        for (int i = 0; i < num_gangs; i++) {
+            pthread_mutex_lock(&viz_context.mutex);
+            // Update arrest status
+            viz_context.gang_states[i].is_in_prison = shared_state->gang_status[i].is_arrested;
+            viz_context.gang_states[i].prison_time_remaining = shared_state->gang_status[i].prison_time;
+            pthread_mutex_unlock(&viz_context.mutex);
+            
+            // Update preparation level - get this data through a message queue
+            int msg_queue_id = msgget(REPORT_QUEUE_KEY + 1000 + i, 0666);
+            if (msg_queue_id != -1) {
+                // Try to receive an update message without blocking
+                struct {
+                    long mtype;
+                    int preparation_level;
+                    CrimeType current_target;
+                    int num_members;
+                } prep_msg;
+                
+                if (msgrcv(msg_queue_id, &prep_msg, sizeof(prep_msg) - sizeof(long), 2, IPC_NOWAIT) != -1) {
+                    // Update visualization with thread safety
+                    pthread_mutex_lock(&viz_context.mutex);
+                    viz_context.gang_states[i].preparation_level = prep_msg.preparation_level;
+                    viz_context.gang_states[i].current_target = prep_msg.current_target;
+                    viz_context.gang_states[i].num_members = prep_msg.num_members;
+                    pthread_mutex_unlock(&viz_context.mutex);
+                    
+                    // Only print updates occasionally to avoid console spam
+                    static int update_count = 0;
+                    if (update_count++ % 10 == 0) {
+                        printf("Queue %d: Updated gang %d preparation: %d%%, target: %s, members: %d\n", 
+                               msg_queue_id, i, prep_msg.preparation_level, 
+                               crime_type_to_string(prep_msg.current_target), 
+                               prep_msg.num_members);
+                    }
+                }
+            }
+        }
+        
+        // If we've reached termination conditions but need to keep the visualization alive
+        if (simulation_ended) {
+            // Occasionally generate new preparation values for the gangs to make visualization interesting
+            static int update_cycle = 0;
+            if (update_cycle++ % 50 == 0) {
+                for (int i = 0; i < num_gangs; i++) {
+                    // Only update gangs that aren't in prison
+                    pthread_mutex_lock(&viz_context.mutex);
+                    if (!viz_context.gang_states[i].is_in_prison) {
+                        // Randomly change preparation level
+                        viz_context.gang_states[i].preparation_level = random_int(5, 95);
+                        
+                        // Randomly change crime type
+                        viz_context.gang_states[i].current_target = (CrimeType)random_int(0, NUM_CRIME_TYPES - 1);
+                    }
+                    pthread_mutex_unlock(&viz_context.mutex);
+                }
+            }
+        }
+        
+        // Sleep to avoid busy waiting
+        usleep(200000); // 0.2 seconds
+    }
     return NULL;
 }
 
@@ -555,36 +626,37 @@ int main(int argc, char* argv[]) {
     } else {
         printf("Allocated gang_states at %p for %d gangs\n", (void*)viz_context.gang_states, num_gangs);
     
-    for (int i = 0; i < num_gangs; i++) {
-        viz_context.gang_states[i].id = i;
-        viz_context.gang_states[i].is_in_prison = false;
-        viz_context.gang_states[i].prison_time_remaining = 0;
-        viz_context.gang_states[i].preparation_level = 0;
-        viz_context.gang_states[i].current_target = BANK_ROBBERY; // Default
-        
-        // Initialize with default members (will be updated later)
-        viz_context.gang_states[i].num_members = random_int(config.min_members_per_gang, config.max_members_per_gang);
-        viz_context.gang_states[i].num_agents = viz_context.gang_states[i].num_members / 3; // Estimate some agents
-        viz_context.gang_states[i].is_active = true;
-        
-        printf("Initialized gang %d with %d members\n", i, viz_context.gang_states[i].num_members);
-        
-        // Create initial message queue for this gang
-        int prep_queue_id = msgget(REPORT_QUEUE_KEY + 1000 + i, IPC_CREAT | 0666);
-        if (prep_queue_id != -1) {
-            struct {
-                long mtype;
-                int preparation_level;
-                CrimeType current_target;
-                int num_members;
-            } prep_msg;
+        for (int i = 0; i < num_gangs; i++) {
+            viz_context.gang_states[i].id = i;
+            viz_context.gang_states[i].is_in_prison = false;
+            viz_context.gang_states[i].prison_time_remaining = 0;
+            viz_context.gang_states[i].preparation_level = 0;
+            viz_context.gang_states[i].current_target = BANK_ROBBERY; // Default
             
-            prep_msg.mtype = 2; // Message type 2 for preparation updates
-            prep_msg.preparation_level = 0;
-            prep_msg.current_target = viz_context.gang_states[i].current_target;
-            prep_msg.num_members = viz_context.gang_states[i].num_members;
+            // Initialize with default members (will be updated later)
+            viz_context.gang_states[i].num_members = random_int(config.min_members_per_gang, config.max_members_per_gang);
+            viz_context.gang_states[i].num_agents = viz_context.gang_states[i].num_members / 3; // Estimate some agents
+            viz_context.gang_states[i].is_active = true;
             
-            msgsnd(prep_queue_id, &prep_msg, sizeof(prep_msg) - sizeof(long), IPC_NOWAIT);
+            printf("Initialized gang %d with %d members\n", i, viz_context.gang_states[i].num_members);
+            
+            // Create initial message queue for this gang
+            int prep_queue_id = msgget(REPORT_QUEUE_KEY + 1000 + i, IPC_CREAT | 0666);
+            if (prep_queue_id != -1) {
+                struct {
+                    long mtype;
+                    int preparation_level;
+                    CrimeType current_target;
+                    int num_members;
+                } prep_msg;
+                
+                prep_msg.mtype = 2; // Message type 2 for preparation updates
+                prep_msg.preparation_level = 0;
+                prep_msg.current_target = viz_context.gang_states[i].current_target;
+                prep_msg.num_members = viz_context.gang_states[i].num_members;
+                
+                msgsnd(prep_queue_id, &prep_msg, sizeof(prep_msg) - sizeof(long), IPC_NOWAIT);
+            }
         }
     }
     
@@ -597,128 +669,156 @@ int main(int argc, char* argv[]) {
     int previous_health_count = 0;
     int health_check_failures = 0;
     
-    // Parent process main loop (simulation updates)
-    while (shared_state->simulation_running) {
-        // Check visualization thread health every few iterations
-        pthread_mutex_lock(&viz_context.mutex);
-        int current_health = viz_context.viz_thread_health;
-        bool thread_running = viz_context.viz_thread_running;
-        pthread_mutex_unlock(&viz_context.mutex);
+    // Parent process main loop
+    if (display && strlen(display) > 0) {
+        // In graphical mode, we need to run updates in a thread before glutMainLoop
+        pthread_t update_thread;
+        if (pthread_create(&update_thread, NULL, gang_state_update_thread, NULL) != 0) {
+            perror("Failed to create update thread");
+        } else {
+            pthread_detach(update_thread);
+        }
         
-        if (thread_running && current_health == previous_health_count) {
-            health_check_failures++;
-            printf("Warning: Visualization thread may be stalled (failure count: %d)\n", health_check_failures);
+        // In graphical mode, we need to run glutMainLoop in the main thread
+        printf("Starting GLUT main loop in the main thread...\n");
+        glutMainLoop();
+        // This code is only reached if glutMainLoop() somehow returns
+        printf("GLUT main loop exited. Terminating simulation...\n");
+    } else {
+        // Text-only mode, run the normal monitoring loop
+        while (shared_state->simulation_running) {
+            // Check visualization thread health every few iterations
+            pthread_mutex_lock(&viz_context.mutex);
+            int current_health = viz_context.viz_thread_health;
+            bool thread_running = viz_context.viz_thread_running;
+            pthread_mutex_unlock(&viz_context.mutex);
             
-            // If health check fails too many times, try to restart visualization
-            if (health_check_failures > 5) {
-                printf("Visualization thread appears to be stuck, attempting recovery...\n");
+            // Health checking logic from original code...
+            if (thread_running && current_health == previous_health_count) {
+                health_check_failures++;
+                printf("Warning: Visualization thread may be stalled (failure count: %d)\n", health_check_failures);
                 
-                // Mark the thread as not running so it will exit if it's actually still active
-                pthread_mutex_lock(&viz_context.mutex);
-                viz_context.simulation_running = false;
-                pthread_mutex_unlock(&viz_context.mutex);
-                
-                // Give it a moment to notice and exit
-                usleep(100000);
-                
-                // Now restart it by creating a new thread
-                pthread_mutex_lock(&viz_context.mutex);
-                viz_context.simulation_running = true;
-                viz_context.viz_thread_running = false;
-                pthread_mutex_unlock(&viz_context.mutex);
-                
-                pthread_t viz_thread;
-                if (pthread_create(&viz_thread, NULL, visualization_thread_func, NULL) != 0) {
-                    perror("Failed to restart visualization thread");
-                } else {
-                    // Detach so we don't need to join
-                    pthread_detach(viz_thread);
-                    printf("Visualization thread restarted\n");
-                    health_check_failures = 0;
-                }
-            }
-        } else if (thread_running) {
-            // Thread is running and health count updated, reset failure counter
-            health_check_failures = 0;
-        }
-        previous_health_count = current_health;
-        
-        // Check if termination conditions are met
-        if (shared_state->total_successful_missions >= config.max_successful_plans) {
-            printf("Simulation ended: Gangs completed %d successful missions.\n", 
-                   shared_state->total_successful_missions);
-            break;
-        }
-        else if (shared_state->total_thwarted_missions >= config.max_thwarted_plans) {
-            printf("Simulation ended: Police thwarted %d gang plans.\n", 
-                   shared_state->total_thwarted_missions);
-            break;
-        }
-        else if (shared_state->total_executed_agents >= config.max_executed_agents) {
-            printf("Simulation ended: %d secret agents have been executed.\n", 
-                   shared_state->total_executed_agents);
-            break;
-        }
-        
-        // Update gang visualization states from shared memory
-        for (int i = 0; i < num_gangs; i++) {
-            // Update arrest status
-            viz_context.gang_states[i].is_in_prison = shared_state->gang_status[i].is_arrested;
-            viz_context.gang_states[i].prison_time_remaining = shared_state->gang_status[i].prison_time;
-            
-            // Update preparation level - get this data through a message queue
-            int msg_queue_id = msgget(REPORT_QUEUE_KEY + 1000 + i, 0666);
-            if (msg_queue_id != -1) {
-                // Try to receive an update message without blocking
-                struct {
-                    long mtype;
-                    int preparation_level;
-                    CrimeType current_target;
-                    int num_members;
-                } prep_msg;
-                
-                if (msgrcv(msg_queue_id, &prep_msg, sizeof(prep_msg) - sizeof(long), 2, IPC_NOWAIT) != -1) {
-                    // Update visualization if we received a message
-                    viz_context.gang_states[i].preparation_level = prep_msg.preparation_level;
-                    viz_context.gang_states[i].current_target = prep_msg.current_target;
-                    viz_context.gang_states[i].num_members = prep_msg.num_members;
+                // If health check fails too many times, try to restart visualization
+                if (health_check_failures > 5) {
+                    printf("Visualization thread appears to be stuck, attempting recovery...\n");
                     
-                    // Only print updates occasionally to avoid console spam
-                    static int update_count = 0;
-                    if (update_count++ % 10 == 0) {
-                        printf("Queue %d: Updated gang %d preparation: %d%%, target: %s, members: %d\n", 
-                               msg_queue_id, i, prep_msg.preparation_level, 
-                               crime_type_to_string(prep_msg.current_target), 
-                               prep_msg.num_members);
+                    // Mark the thread as not running so it will exit if it's actually still active
+                    pthread_mutex_lock(&viz_context.mutex);
+                    viz_context.simulation_running = false;
+                    pthread_mutex_unlock(&viz_context.mutex);
+                    
+                    // Give it a moment to notice and exit
+                    usleep(100000);
+                    
+                    // Now restart it by creating a new thread
+                    pthread_mutex_lock(&viz_context.mutex);
+                    viz_context.simulation_running = true;
+                    viz_context.viz_thread_running = false;
+                    pthread_mutex_unlock(&viz_context.mutex);
+                    
+                    pthread_t viz_thread;
+                    if (pthread_create(&viz_thread, NULL, visualization_thread_func, NULL) != 0) {
+                        perror("Failed to restart visualization thread");
+                    } else {
+                        // Detach so we don't need to join
+                        pthread_detach(viz_thread);
+                        printf("Visualization thread restarted\n");
+                        health_check_failures = 0;
+                    }
+                }
+            } else if (thread_running) {
+                // Thread is running and health count updated, reset failure counter
+                health_check_failures = 0;
+            }
+            previous_health_count = current_health;
+            
+            // Check if termination conditions are met
+            if (shared_state->total_successful_missions >= config.max_successful_plans) {
+                printf("Simulation ended: Gangs completed %d successful missions.\n", 
+                      shared_state->total_successful_missions);
+                break;
+            }
+            else if (shared_state->total_thwarted_missions >= config.max_thwarted_plans) {
+                printf("Simulation ended: Police thwarted %d gang plans.\n", 
+                      shared_state->total_thwarted_missions);
+                break;
+            }
+            else if (shared_state->total_executed_agents >= config.max_executed_agents) {
+                printf("Simulation ended: %d secret agents have been executed.\n", 
+                      shared_state->total_executed_agents);
+                break;
+            }
+            
+            // Update gang visualization states from shared memory
+            for (int i = 0; i < num_gangs; i++) {
+                // Update arrest status
+                viz_context.gang_states[i].is_in_prison = shared_state->gang_status[i].is_arrested;
+                viz_context.gang_states[i].prison_time_remaining = shared_state->gang_status[i].prison_time;
+                
+                // Update preparation level - get this data through a message queue
+                int msg_queue_id = msgget(REPORT_QUEUE_KEY + 1000 + i, 0666);
+                if (msg_queue_id != -1) {
+                    // Try to receive an update message without blocking
+                    struct {
+                        long mtype;
+                        int preparation_level;
+                        CrimeType current_target;
+                        int num_members;
+                    } prep_msg;
+                    
+                    if (msgrcv(msg_queue_id, &prep_msg, sizeof(prep_msg) - sizeof(long), 2, IPC_NOWAIT) != -1) {
+                        // Update visualization if we received a message
+                        viz_context.gang_states[i].preparation_level = prep_msg.preparation_level;
+                        viz_context.gang_states[i].current_target = prep_msg.current_target;
+                        viz_context.gang_states[i].num_members = prep_msg.num_members;
+                        
+                        // Only print updates occasionally to avoid console spam
+                        static int update_count = 0;
+                        if (update_count++ % 10 == 0) {
+                            printf("Queue %d: Updated gang %d preparation: %d%%, target: %s, members: %d\n", 
+                                   msg_queue_id, i, prep_msg.preparation_level, 
+                                   crime_type_to_string(prep_msg.current_target), 
+                                   prep_msg.num_members);
+                        }
+                    } else {
+                        // Debug message when no message is available (print less frequently)
+                        static int no_message_count = 0;
+                        if (no_message_count++ % 100 == 0) {  // Reduced frequency to every 100th failure
+                            printf("No message available for gang %d in queue %d (errno: %d)\n", 
+                                   i, msg_queue_id, errno);
+                        }
                     }
                 } else {
-                    // Debug message when no message is available (print less frequently)
-                    static int no_message_count = 0;
-                    if (no_message_count++ % 100 == 0) {  // Reduced frequency to every 100th failure
-                        printf("No message available for gang %d in queue %d (errno: %d)\n", 
-                               i, msg_queue_id, errno);
+                    // Only print occasionally to avoid console spam
+                    static int queue_fail_count = 0;
+                    if (queue_fail_count++ % 200 == 0) {  // Reduced frequency to every 200th failure
+                        printf("Failed to get message queue for gang %d (key: %d, errno: %d)\n", 
+                               i, REPORT_QUEUE_KEY + 1000 + i, errno);
                     }
                 }
-            } else {
-                // Only print occasionally to avoid console spam
-                static int queue_fail_count = 0;
-                if (queue_fail_count++ % 200 == 0) {  // Reduced frequency to every 200th failure
-                    printf("Failed to get message queue for gang %d (key: %d, errno: %d)\n", 
-                           i, REPORT_QUEUE_KEY + 1000 + i, errno);
-                }
             }
+            
+            // Update animation time
+            viz_context.animation_time += 0.1f;
+            
+            // Sleep to avoid busy waiting
+            usleep(500000); // 0.5 seconds
         }
-        
-        // Update animation time
-        viz_context.animation_time += 0.1f;
-        
-        // Sleep to avoid busy waiting
-        usleep(100000);
     }
     
-    // Wait for all child processes to terminate
-    printf("Waiting for processes to terminate...\n");
+    // Set the flag to indicate simulation is stopping
+    shared_state->simulation_running = false;
+    
+    // Signal all child processes to terminate
     signal_handler(SIGTERM);
     
+    // Wait for all child processes to terminate
+    printf("Waiting for all processes to terminate...\n");
+    while (wait(NULL) > 0);
+    
+    // Clean up resources
+    cleanup();
+    
+    printf("Simulation completed successfully.\n");
     return 0;
 }
