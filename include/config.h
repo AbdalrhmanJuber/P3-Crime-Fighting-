@@ -37,6 +37,8 @@ typedef struct {
     int agent_infiltration_success_rate;
     int agent_suspicion_threshold;
     int police_action_threshold;
+    int truth_gain;        // Knowledge gain when receiving truthful information
+    int false_penalty;     // Knowledge penalty when receiving false information
     
     // Mission outcomes
     int mission_success_rate_base;

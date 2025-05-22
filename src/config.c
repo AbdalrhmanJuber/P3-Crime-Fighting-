@@ -48,6 +48,8 @@ SimulationConfig load_config(const char* config_file) {
     config.agent_infiltration_success_rate = 60;
     config.agent_suspicion_threshold = 75;
     config.police_action_threshold = 80;
+    config.truth_gain = 10;        // Default knowledge gain
+    config.false_penalty = 5;      // Default knowledge penalty
     config.mission_success_rate_base = 50;
     config.member_death_probability = 10;
     config.prison_time_min = 5;
@@ -118,6 +120,12 @@ SimulationConfig load_config(const char* config_file) {
         else if (strcmp(key, "POLICE_ACTION_THRESHOLD") == 0) {
             config.police_action_threshold = atoi(value);
         }
+        else if (strcmp(key, "TRUTH_GAIN") == 0) {
+            config.truth_gain = atoi(value);
+        }
+        else if (strcmp(key, "FALSE_PENALTY") == 0) {
+            config.false_penalty = atoi(value);
+        }
         else if (strcmp(key, "MISSION_SUCCESS_RATE_BASE") == 0) {
             config.mission_success_rate_base = atoi(value);
         }
@@ -165,6 +173,8 @@ void print_config(SimulationConfig config) {
     printf("  - Infiltration success rate: %d%%\n", config.agent_infiltration_success_rate);
     printf("  - Suspicion threshold: %d%%\n", config.agent_suspicion_threshold);
     printf("  - Police action threshold: %d%%\n", config.police_action_threshold);
+    printf("  - Truth gain: %d\n", config.truth_gain);
+    printf("  - False penalty: %d\n", config.false_penalty);
     
     printf("\nMission Outcomes:\n");
     printf("  - Base mission success rate: %d%%\n", config.mission_success_rate_base);

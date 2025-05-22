@@ -3,9 +3,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include "../include/gang.h"
 #include "../include/utils.h"
 #include "../include/ipc.h"
+
+// Original deliver_truth function removed - using the new version with false_info_probability parameter
 
 // Initialize a gang
 void initialize_gang(Gang* gang, int id, int num_members, int num_ranks, SimulationConfig config) {
@@ -19,6 +22,8 @@ void initialize_gang(Gang* gang, int id, int num_members, int num_ranks, Simulat
     gang->thwarted_missions = 0;
     gang->executed_agents = 0;
     gang->false_info_probability = config.false_info_probability;
+    gang->truth_gain = config.truth_gain;
+    gang->false_penalty = config.false_penalty;
     gang->report_queue_id = -1; // Will be set by the main process
     
     // Initialize mutex and condition variable
@@ -34,6 +39,9 @@ void initialize_gang(Gang* gang, int id, int num_members, int num_ranks, Simulat
         gang->members[i].rank = i % num_ranks;  // Distribute ranks evenly at first
         gang->members[i].preparation_level = 0;
         gang->members[i].knowledge_rate = 0;
+        gang->members[i].suspicion = 0;
+        gang->members[i].alive = true;
+        gang->members[i].in_prison = false;
         gang->members[i].gang_ptr = gang;
         
         // Determine if this member is a secret agent
@@ -78,27 +86,78 @@ void* gang_member_routine(void* arg) {
                 member->preparation_level = gang->required_preparation_level;
             }
             
-            // If member is a secret agent, gather intelligence
-            if (member->is_secret_agent) {
-                // Update knowledge rate based on interactions with other members
-                // Higher rank members have more accurate information
-                int base_knowledge_increase = 5 + (member->rank * 3);
+            // Knowledge exchange happens for all members
+            // For regular members, this is just normal gang communication
+            // For secret agents, this represents intelligence gathering
+            
+            // Simulate information exchange with other members
+            // For each interaction, determine if truth or disinformation is shared
+            for (int i = 0; i < gang->num_members; i++) {
+                if (i == member->id) continue; // Skip self
                 
-                // False information might decrease knowledge
-                if (random_event(gang->false_info_probability)) {
-                    member->knowledge_rate -= base_knowledge_increase / 2;
+                // Only interact with active members
+                if (!gang->members[i].alive || gang->members[i].in_prison) continue;
+                
+                // Determine if this member receives truth or disinformation
+                int sender_rank = gang->members[i].rank;
+                int receiver_rank = member->rank;
+                bool received_truth = deliver_truth(sender_rank, receiver_rank, gang->false_info_probability);
+                
+                // For secret agents, update their knowledge based on truth/falsehood
+                if (member->is_secret_agent) {
+                    // R-6: Knowledge Accumulation with configurable truth gain and false penalty
+                    if (received_truth) {
+                        // Received true information, increases knowledge by truth_gain
+                        member->knowledge += gang->truth_gain;
+                        // Also update knowledge_rate for backward compatibility
+                        member->knowledge_rate += gang->truth_gain;
+                    } else {
+                        // Received false information, decreases knowledge by false_penalty
+                        member->knowledge -= gang->false_penalty;
+                        // Also update knowledge_rate for backward compatibility
+                        member->knowledge_rate -= gang->false_penalty;
+                    }
+                    
+                    // R-5: Agents are unaware of each other - treat all members as regular members
+                    // Secret agent doesn't know if the other member is an agent too
+                    
+                    // Ensure knowledge stays within bounds
+                    if (member->knowledge < 0) {
+                        member->knowledge = 0;
+                    } else if (member->knowledge > 100) {
+                        member->knowledge = 100;
+                    }
+                    
+                    // Ensure knowledge_rate stays within bounds for backward compatibility
                     if (member->knowledge_rate < 0) {
                         member->knowledge_rate = 0;
-                    }
-                } else {
-                    member->knowledge_rate += base_knowledge_increase;
-                    if (member->knowledge_rate > 100) {
+                    } else if (member->knowledge_rate > 100) {
                         member->knowledge_rate = 100;
                     }
-                }                    // Report to police if suspicion is high enough
-                    if (member->knowledge_rate >= gang->required_preparation_level / 2) {
-                        // Create intelligence report
-                        IntelligenceReport report;
+                } else {
+                    // For regular members, just adjust their knowledge normally
+                    if (received_truth) {
+                        member->knowledge += 5;
+                    } else {
+                        member->knowledge -= 3;
+                    }
+                    
+                    // Ensure knowledge stays within bounds
+                    if (member->knowledge < 0) {
+                        member->knowledge = 0;
+                    } else if (member->knowledge > 100) {
+                        member->knowledge = 100;
+                    }
+                }
+            }
+            
+            // If member is a secret agent, potentially report to police
+            if (member->is_secret_agent) {
+                
+                // Report to police if suspicion is high enough
+                if (member->knowledge_rate >= gang->required_preparation_level / 2) {
+                    // Create intelligence report
+                    IntelligenceReport report;
                         report.gang_id = gang->id;
                         report.agent_id = member->id;
                         report.suspected_target = gang->current_target;
@@ -356,4 +415,43 @@ void cleanup_gang(Gang* gang) {
     free(gang->members);
     
     log_message("Gang %d resources cleaned up", gang->id);
+}
+
+// Helper function to determine if truth is delivered based on rank distance
+// Returns true if truthful information should be delivered, false for disinformation
+bool deliver_truth(int sender_rank, int receiver_rank, int false_info_probability) {
+    // Calculate rank distance
+    int rank_distance = abs(sender_rank - receiver_rank);
+    
+    // If sender and receiver are the same rank, always deliver truth
+    if (rank_distance == 0) {
+        return true;
+    }
+    
+    // Base probability affected by the gang's false_info_probability config
+    int base_modifier = false_info_probability / 10; // Scale down the config value
+    
+    // If sender has higher rank than receiver, probability of truth is higher
+    if (sender_rank > receiver_rank) {
+        // Base probability of truth - decreases with rank distance
+        int probability_of_truth = 90 - (rank_distance * 10) - base_modifier;
+        
+        // Ensure minimum probability of 30%
+        if (probability_of_truth < 30) {
+            probability_of_truth = 30;
+        }
+        
+        return random_event(probability_of_truth);
+    } else {
+        // If sender has lower rank, they may not have full information
+        // The lower the sender's rank compared to receiver, the less likely they have truth
+        int probability_of_truth = 70 - (rank_distance * 15) - base_modifier;
+        
+        // Ensure minimum probability of 20%
+        if (probability_of_truth < 20) {
+            probability_of_truth = 20;
+        }
+        
+        return random_event(probability_of_truth);
+    }
 }
