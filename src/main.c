@@ -156,13 +156,30 @@ void run_gang_process(int gang_id, SimulationConfig config) {
             if (mission_planned) {
                 // Check if preparation time has elapsed
                 if (time_spent_preparing >= gang.preparation_time) {
+                    // Store previous mission counts to detect changes
+                    int prev_successful = gang.successful_missions;
+                    int prev_thwarted = gang.thwarted_missions;
+                    int prev_executed = gang.executed_agents;
+                    
                     // Execute mission
                     execute_mission(&gang, config);
                     
-                    // Update shared memory
+                    // Update shared memory based on mission outcome
                     semaphore_wait(sem_id, 0);
-                    if (gang.successful_missions > 0) {
+                    if (gang.successful_missions > prev_successful) {
                         shm->total_successful_missions++;
+                        log_message("Gang %d mission succeeded - total successful missions: %d", 
+                                   gang_id, shm->total_successful_missions);
+                    }
+                    if (gang.thwarted_missions > prev_thwarted) {
+                        shm->total_thwarted_missions++;
+                        log_message("Gang %d mission failed - total thwarted missions: %d", 
+                                   gang_id, shm->total_thwarted_missions);
+                    }
+                    if (gang.executed_agents > prev_executed) {
+                        shm->total_executed_agents += (gang.executed_agents - prev_executed);
+                        log_message("Gang %d executed %d agents - total executed agents: %d", 
+                                   gang_id, (gang.executed_agents - prev_executed), shm->total_executed_agents);
                     }
                     semaphore_signal(sem_id, 0);
                     
