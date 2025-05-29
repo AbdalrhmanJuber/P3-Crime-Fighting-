@@ -280,8 +280,6 @@ void execute_mission(Gang* gang, SimulationConfig config) {
 
 // Investigate for secret agents
 void investigate_for_agents(Gang* gang, SimulationConfig config) {
-    pthread_mutex_lock(&gang->gang_mutex);
-    
     log_message("Gang %d starting internal investigation", gang->id);
     
     // Factors in investigation
@@ -289,25 +287,66 @@ void investigate_for_agents(Gang* gang, SimulationConfig config) {
         int member_id;
         int suspicion_score;
         bool is_agent;
+        int rank;
+        int prep_level;
+        int knowledge_rate;
     } SuspiciousAgent;
     
-    SuspiciousAgent* suspects = (SuspiciousAgent*)malloc(gang->num_members * sizeof(SuspiciousAgent));
+    // First, copy member data with minimal mutex holding time
+    pthread_mutex_lock(&gang->gang_mutex);
+    int num_members = gang->num_members;
+    int num_ranks = gang->num_ranks;
+    int required_prep = gang->required_preparation_level;
+    int gang_id = gang->id;
+    
+    // Create temporary copies of member data to avoid holding mutex during investigation
+    typedef struct {
+        int preparation_level;
+        int knowledge_rate;
+        int rank;
+        bool is_secret_agent;
+    } MemberSnapshot;
+    
+    MemberSnapshot* member_snapshots = (MemberSnapshot*)malloc(num_members * sizeof(MemberSnapshot));
+    if (member_snapshots == NULL) {
+        log_message("Gang %d: Failed to allocate memory for investigation", gang->id);
+        pthread_mutex_unlock(&gang->gang_mutex);
+        return;
+    }
+    
+    // Copy member data quickly
+    for (int i = 0; i < num_members; i++) {
+        member_snapshots[i].preparation_level = gang->members[i].preparation_level;
+        member_snapshots[i].knowledge_rate = gang->members[i].knowledge_rate;
+        member_snapshots[i].rank = gang->members[i].rank;
+        member_snapshots[i].is_secret_agent = gang->members[i].is_secret_agent;
+    }
+    pthread_mutex_unlock(&gang->gang_mutex);
+    
+    // Now do the investigation work WITHOUT holding the mutex
+    SuspiciousAgent* suspects = (SuspiciousAgent*)malloc(num_members * sizeof(SuspiciousAgent));
+    if (suspects == NULL) {
+        log_message("Gang %d: Failed to allocate memory for suspects", gang_id);
+        free(member_snapshots);
+        return;
+    }
+    
     int num_suspects = 0;
     
     // First phase: Calculate suspicion scores based on multiple factors
-    for (int i = 0; i < gang->num_members; i++) {
-        GangMember* member = &gang->members[i];
+    for (int i = 0; i < num_members; i++) {
+        MemberSnapshot* member = &member_snapshots[i];
         
         // Base suspicion score
         int suspicion_score = 0;
         
         // 1. Low preparation level may indicate lack of commitment
-        if (member->preparation_level < (gang->required_preparation_level / 2)) {
+        if (member->preparation_level < (required_prep / 2)) {
             suspicion_score += 20;
         }
         
         // 2. Newer members (lower ranks) are more suspicious
-        suspicion_score += (gang->num_ranks - member->rank) * 5;
+        suspicion_score += (num_ranks - member->rank) * 5;
         
         // 3. Check for suspicious behavior patterns (could be expanded)
         if (member->knowledge_rate > 80 && member->rank < 2) {
@@ -320,14 +359,16 @@ void investigate_for_agents(Gang* gang, SimulationConfig config) {
             suspects[num_suspects].member_id = i;
             suspects[num_suspects].suspicion_score = suspicion_score;
             suspects[num_suspects].is_agent = member->is_secret_agent;
+            suspects[num_suspects].rank = member->rank;
+            suspects[num_suspects].prep_level = member->preparation_level;
+            suspects[num_suspects].knowledge_rate = member->knowledge_rate;
             num_suspects++;
         }
     }
     
-    log_message("Gang %d identified %d suspicious members", gang->id, num_suspects);
+    log_message("Gang %d identified %d suspicious members", gang_id, num_suspects);
     
-    // Second phase: Interrogate suspects starting with most suspicious
-    // Sort suspects by suspicion score (simple bubble sort)
+    // Second phase: Sort suspects by suspicion score (simple bubble sort)
     for (int i = 0; i < num_suspects - 1; i++) {
         for (int j = 0; j < num_suspects - i - 1; j++) {
             if (suspects[j].suspicion_score < suspects[j + 1].suspicion_score) {
@@ -338,60 +379,104 @@ void investigate_for_agents(Gang* gang, SimulationConfig config) {
         }
     }
     
-    // Interrogate suspects (starting with most suspicious)
+    // Interrogate suspects (starting with most suspicious) - still no mutex needed
     int agents_found = 0;
+    typedef struct {
+        int member_id;
+        bool should_execute;
+        bool should_penalize;
+    } InvestigationResult;
+    
+    InvestigationResult* results = (InvestigationResult*)malloc(num_suspects * sizeof(InvestigationResult));
+    if (results == NULL) {
+        log_message("Gang %d: Failed to allocate memory for results", gang_id);
+        free(suspects);
+        free(member_snapshots);
+        return;
+    }
+    
+    int num_results = 0;
     for (int i = 0; i < num_suspects && i < 3; i++) {  // Limit interrogations to top 3 suspects
         int member_id = suspects[i].member_id;
-        int rank = gang->members[member_id].rank;
+        
+        // Validate member_id to prevent array bounds issues
+        if (member_id < 0 || member_id >= num_members) {
+            log_message("Gang %d: Invalid member_id %d in investigation", gang_id, member_id);
+            continue;
+        }
+        
+        int rank = suspects[i].rank;
         
         // Probability of uncovering agent depends on suspicion score and rank
-        int discovery_chance = 20 + (gang->members[member_id].rank * 10) + (suspects[i].suspicion_score / 5);
+        int discovery_chance = 20 + (rank * 10) + (suspects[i].suspicion_score / 5);
         
         // Cap at 90%
         if (discovery_chance > 90) discovery_chance = 90;
         
-        if (gang->members[member_id].is_secret_agent && random_event(discovery_chance)) {
+        if (suspects[i].is_agent && random_event(discovery_chance)) {
             log_message("Gang %d interrogated and uncovered secret agent %d (rank %d, suspicion: %d)", 
-                      gang->id, member_id, rank, suspects[i].suspicion_score);
+                      gang_id, member_id, rank, suspects[i].suspicion_score);
             
-            // Execute the agent
-            gang->executed_agents++;
-            
-            // Replace the agent with a new member
-            gang->members[member_id].rank = 0;  // Lowest rank
-            gang->members[member_id].preparation_level = 0;
-            gang->members[member_id].knowledge_rate = 0;
-            gang->members[member_id].is_secret_agent = random_event(config.agent_infiltration_success_rate);
-            
+            results[num_results].member_id = member_id;
+            results[num_results].should_execute = true;
+            results[num_results].should_penalize = false;
+            num_results++;
             agents_found++;
-        } else if (!gang->members[member_id].is_secret_agent) {
+        } else if (!suspects[i].is_agent) {
             log_message("Gang %d interrogated innocent member %d (rank %d, suspicion: %d)", 
-                      gang->id, member_id, rank, suspects[i].suspicion_score);
+                      gang_id, member_id, rank, suspects[i].suspicion_score);
             
             // Penalty for wrongly accusing a member - they might become less loyal
             if (random_event(40)) {
-                gang->members[member_id].preparation_level = (gang->members[member_id].preparation_level * 3) / 4;
+                results[num_results].member_id = member_id;
+                results[num_results].should_execute = false;
+                results[num_results].should_penalize = true;
+                num_results++;
                 log_message("Member %d lost motivation due to false accusation", member_id);
             }
         }
     }
     
-    // If no agents found but we know they exist, increase paranoia for next investigation
+    // Check for paranoia increase
     int actual_agents = 0;
-    for (int i = 0; i < gang->num_members; i++) {
-        if (gang->members[i].is_secret_agent) {
+    for (int i = 0; i < num_members; i++) {
+        if (member_snapshots[i].is_secret_agent) {
             actual_agents++;
         }
     }
     
     if (agents_found == 0 && actual_agents > 0) {
-        log_message("Gang %d failed to find any agents, paranoia increasing", gang->id);
+        log_message("Gang %d failed to find any agents, paranoia increasing", gang_id);
     }
     
-    // Free allocated memory
-    free(suspects);
-    
+    // Now apply the results - lock mutex only briefly to update gang state
+    pthread_mutex_lock(&gang->gang_mutex);
+    for (int i = 0; i < num_results; i++) {
+        int member_id = results[i].member_id;
+        
+        // Double-check bounds again with current gang state
+        if (member_id >= 0 && member_id < gang->num_members) {
+            if (results[i].should_execute) {
+                // Execute the agent
+                gang->executed_agents++;
+                
+                // Replace the agent with a new member
+                gang->members[member_id].rank = 0;  // Lowest rank
+                gang->members[member_id].preparation_level = 0;
+                gang->members[member_id].knowledge_rate = 0;
+                gang->members[member_id].is_secret_agent = random_event(config.agent_infiltration_success_rate);
+            } else if (results[i].should_penalize) {
+                // Penalize innocent member
+                gang->members[member_id].preparation_level = (gang->members[member_id].preparation_level * 3) / 4;
+            }
+        }
+    }
     pthread_mutex_unlock(&gang->gang_mutex);
+    
+    // Free allocated memory
+    free(results);
+    free(suspects);
+    free(member_snapshots);
 }
 
 // Clean up gang resources

@@ -6,6 +6,7 @@
 #include "../include/police.h"
 #include "../include/utils.h"
 #include "../include/ipc.h"
+#include "../include/config.h"
 
 // Initialize police
 void initialize_police(Police* police, SimulationConfig config) {
@@ -108,8 +109,15 @@ bool decide_on_action(Police* police, int gang_id, SimulationConfig config) {
     }
     
     // Decision logic: take action if average suspicion is above threshold
-    // and there is at least one reliable report
-    bool decision = (avg_suspicion >= config.police_action_threshold && num_reliable_reports > 0);
+    // and there is at least one reliable report, OR if suspicion is very high (>= 95)
+    bool decision = (avg_suspicion >= config.police_action_threshold && num_reliable_reports > 0) ||
+                   (avg_suspicion >= 95 && num_reports_for_gang >= 3);
+    
+    // Add debug logging to understand why decisions aren't being made
+    if (num_reports_for_gang > 0) {
+        log_message("Police analysis for gang %d: %d reports, avg suspicion %d, reliable reports %d, threshold %d",
+                    gang_id, num_reports_for_gang, avg_suspicion, num_reliable_reports, config.police_action_threshold);
+    }
     
     if (decision) {
         log_message("Police decided to take action against gang %d (Avg suspicion: %d, Reliable reports: %d, Suspected crime: %s)",
@@ -175,32 +183,97 @@ void arrest_gang_members(Police* police, int gang_id, SimulationConfig config) {
 void* police_routine(void* arg) {
     Police* police = (Police*)arg;
     
+    // Get configuration for decision making
+    SimulationConfig config = load_config("config/simulation_config.txt");
+    
     // Main police monitoring loop
     while (1) {
-        pthread_mutex_lock(&police->police_mutex);
-        
-        // Analyze all reports to identify patterns
-        int reports_by_gang[100] = {0};  // Count reports by gang ID (assumes max 100 gangs)
-        int max_reports = 0;
         int max_gang_id = -1;
+        int max_reports = 0;
+        bool should_take_action = false;
         
-        for (int i = 0; i < police->num_reports; i++) {
-            int gang_id = police->reports[i].gang_id;
-            reports_by_gang[gang_id]++;
+        // Analyze all reports to identify patterns (with proper mutex handling)
+        pthread_mutex_lock(&police->police_mutex);
+        {
+            int reports_by_gang[100] = {0};  // Count reports by gang ID (assumes max 100 gangs)
             
-            if (reports_by_gang[gang_id] > max_reports) {
-                max_reports = reports_by_gang[gang_id];
-                max_gang_id = gang_id;
+            for (int i = 0; i < police->num_reports; i++) {
+                int gang_id = police->reports[i].gang_id;
+                reports_by_gang[gang_id]++;
+                
+                if (reports_by_gang[gang_id] > max_reports) {
+                    max_reports = reports_by_gang[gang_id];
+                    max_gang_id = gang_id;
+                }
             }
         }
+        pthread_mutex_unlock(&police->police_mutex);
         
         // Log police activity periodically
         if (max_gang_id >= 0 && max_reports > 2) {
             log_message("Police monitoring gang %d closely (%d reports received)", 
                        max_gang_id, max_reports);
+            
+            // Check if we should take action against the most reported gang
+            should_take_action = decide_on_action(police, max_gang_id, config);
+            
+            if (should_take_action) {
+                log_message("Police routine decided to take proactive action against gang %d", max_gang_id);
+                arrest_gang_members(police, max_gang_id, config);
+                
+                // Update shared memory
+                int shm_id = shmget(SHARED_MEMORY_KEY, 0, 0);
+                if (shm_id != -1) {
+                    SharedState* shm = attach_shared_memory(shm_id);
+                    int sem_id = semget(SEMAPHORE_KEY, 0, 0);
+                    if (sem_id != -1) {
+                        semaphore_wait(sem_id, 0);
+                        shm->total_thwarted_missions++;
+                        semaphore_signal(sem_id, 0);
+                    }
+                    detach_shared_memory(shm);
+                }
+                
+                // Clear reports for this gang after successful arrest
+                pthread_mutex_lock(&police->police_mutex);
+                int new_report_count = 0;
+                for (int i = 0; i < police->num_reports; i++) {
+                    if (police->reports[i].gang_id != max_gang_id) {
+                        police->reports[new_report_count++] = police->reports[i];
+                    }
+                }
+                police->num_reports = new_report_count;
+                pthread_mutex_unlock(&police->police_mutex);
+            } else {
+                // If no action taken but we have many reports, clear old reports to prevent infinite loop
+                // Clear reports for gangs that have been analyzed multiple times without action
+                if (max_reports >= 5) {
+                    log_message("Police clearing stale reports for gang %d (insufficient evidence for action)", max_gang_id);
+                    pthread_mutex_lock(&police->police_mutex);
+                    int new_report_count = 0;
+                    for (int i = 0; i < police->num_reports; i++) {
+                        if (police->reports[i].gang_id != max_gang_id) {
+                            police->reports[new_report_count++] = police->reports[i];
+                        }
+                    }
+                    police->num_reports = new_report_count;
+                    pthread_mutex_unlock(&police->police_mutex);
+                }
+            }
         }
         
-        pthread_mutex_unlock(&police->police_mutex);
+        // Periodic cleanup: clear all reports every 30 iterations to prevent infinite accumulation
+        static int cleanup_counter = 0;
+        cleanup_counter++;
+        if (cleanup_counter >= 30) {
+            cleanup_counter = 0;
+            pthread_mutex_lock(&police->police_mutex);
+            if (police->num_reports > 10) {
+                log_message("Police performing periodic cleanup of %d stale reports", police->num_reports);
+                police->num_reports = 0; // Clear all reports periodically
+            }
+            pthread_mutex_unlock(&police->police_mutex);
+        }
         
         // Sleep to avoid busy waiting
         sleep(2);
